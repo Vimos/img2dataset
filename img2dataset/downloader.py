@@ -5,15 +5,11 @@ from multiprocessing.pool import ThreadPool
 from threading import Semaphore
 from typing import List, Optional
 from tqdm import tqdm
-import albumentations as A
-import cv2
 import os
 import urllib.request
 import fire
 import functools
-import webdataset as wds
 import io
-import numpy as np
 import pandas as pd
 import math
 import exifread
@@ -23,6 +19,8 @@ import logging
 import time
 import wandb
 from .logging_utils import CappedCounter, SpeedLogger, StatusTableLogger
+from .resizer import Resizer
+from .writer import WebDatasetSampleWriter, FilesSampleWriter
 
 logging.getLogger("exifread").setLevel(level=logging.CRITICAL)
 
@@ -44,126 +42,6 @@ def download_image(row, timeout):
         if img_stream is not None:
             img_stream.close()
         return key, None, str(err)
-
-
-class Resizer:
-    """Resize images"""
-
-    def __init__(self, image_size, resize_mode, resize_only_if_bigger):
-        self.image_size = image_size
-        self.resize_mode = resize_mode
-        self.resize_only_if_bigger = resize_only_if_bigger
-
-        if resize_mode not in ["no", "keep_ratio", "center_crop", "border"]:
-            raise Exception(f"Invalid option for resize_mode: {resize_mode}")
-
-        if resize_mode == "keep_ratio":
-            self.resize_tfm = A.SmallestMaxSize(image_size, interpolation=cv2.INTER_LANCZOS4)
-        elif resize_mode == "center_crop":
-            self.resize_tfm = A.Compose(
-                [A.SmallestMaxSize(image_size, interpolation=cv2.INTER_LANCZOS4), A.CenterCrop(image_size, image_size),]
-            )
-        elif resize_mode == "border":
-            self.resize_tfm = A.Compose(
-                [
-                    A.LongestMaxSize(image_size, interpolation=cv2.INTER_LANCZOS4),
-                    A.PadIfNeeded(image_size, image_size, border_mode=cv2.BORDER_CONSTANT, value=[255, 255, 255],),
-                ]
-            )
-        elif resize_mode == "no":
-            pass
-
-    def __call__(self, img_stream):
-        try:
-            img = cv2.imdecode(np.frombuffer(img_stream.read(), np.uint8), cv2.IMREAD_UNCHANGED)
-            if img is None:
-                raise Exception("Image decoding error")
-            if len(img.shape) == 3 and img.shape[-1] == 4:
-                # alpha matting with white background
-                alpha = img[:, :, 3, np.newaxis]
-                img = alpha / 255 * img[..., :3] + 255 - alpha
-                img = np.rint(img.clip(min=0, max=255)).astype(np.uint8)
-            original_height, original_width = img.shape[:2]
-
-            # resizing in following conditions
-            if self.resize_mode != "no" and (
-                not self.resize_only_if_bigger
-                or (
-                    self.resize_mode in ["keep_ratio", "center_crop"]
-                    # smallest side contained to image_size (largest cropped)
-                    and min(img.shape[:2]) > self.image_size
-                )
-                or (
-                    self.resize_mode == "border"
-                    # largest side contained to image_size
-                    and max(img.shape[:2]) > self.image_size
-                )
-            ):
-                img = self.resize_tfm(image=img)["image"]
-
-            height, width = img.shape[:2]
-            img_str = cv2.imencode(".jpg", img)[1].tobytes()
-            del img
-            return img_str, width, height, original_width, original_height, None
-
-        except Exception as err:  # pylint: disable=broad-except
-            return None, None, None, None, None, str(err)
-
-
-class WebDatasetSampleWriter:
-    """WebDatasetSampleWriter is a image+caption writer to webdataset"""
-
-    def __init__(self, shard_id, output_folder, save_caption, save_metadata, oom_shard_count):
-        self.oom_shard_count = oom_shard_count
-        shard_name = "{shard_id:0{oom_shard_count}d}".format(shard_id=shard_id, oom_shard_count=oom_shard_count)
-        self.shard_id = shard_id
-        self.tarwriter = wds.TarWriter(f"{output_folder}/{shard_name}.tar")
-        self.save_caption = save_caption
-        self.save_metadata = save_metadata
-
-    def write(self, img_str, key, caption, meta):
-        sample = {"__key__": key, "jpg": img_str}
-        if self.save_caption:
-            sample["txt"] = str(caption) if caption is not None else ""
-        if self.save_metadata:
-            sample["json"] = json.dumps(meta, indent=4)
-        self.tarwriter.write(sample)
-
-    def close(self):
-        self.tarwriter.close()
-
-
-class FilesSampleWriter:
-    """FilesSampleWriter is a caption+image writer to files"""
-
-    def __init__(self, shard_id, output_folder, save_caption, save_metadata, oom_shard_count):
-        self.oom_shard_count = oom_shard_count
-        shard_name = "{shard_id:0{oom_shard_count}d}".format(shard_id=shard_id, oom_shard_count=oom_shard_count)
-        self.shard_id = shard_id
-        self.subfolder = f"{output_folder}/{shard_name}"
-        if not os.path.exists(self.subfolder):
-            os.mkdir(self.subfolder)
-        self.save_caption = save_caption
-        self.save_metadata = save_metadata
-
-    def write(self, img_str, key, caption, meta):
-        """Write sample to disk"""
-        filename = f"{self.subfolder}/{key}.jpg"
-        with open(filename, "wb") as f:
-            f.write(img_str)
-        if self.save_caption:
-            caption = str(caption) if caption is not None else ""
-            caption_filename = f"{self.subfolder}/{key}.txt"
-            with open(caption_filename, "w") as f:
-                f.write(str(caption))
-        if self.save_metadata:
-            j = json.dumps(meta, indent=4)
-            meta_filename = f"{self.subfolder}/{key}.json"
-            with open(meta_filename, "w") as f:
-                f.write(j)
-
-    def close(self):
-        pass
 
 
 def compute_key(key, shard_id, oom_sample_per_shard, oom_shard_count):
